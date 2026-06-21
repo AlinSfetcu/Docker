@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  empty-image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: empty-image:latest
+    networks:
+      - docker-network
+
+networks:
+  docker-network:
+    driver: bridge
