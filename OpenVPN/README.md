@@ -66,6 +66,381 @@ docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
   ovpn_getclient <CLIENT_NAME> > <CLIENT_NAME>.ovpn
 ```
 
+## Setting Up NAS as VPN Server
+
+This section explains how to deploy the OpenVPN server on a Synology NAS to allow remote devices to securely access your NAS and home network.
+
+### Prerequisites for NAS Deployment
+
+- **Synology NAS** with Docker support (DS920+, DS721+2, DS225+, DS725+, etc.)
+- **Docker** installed via Package Center
+- **Port forwarding** configured on your router
+- **Dynamic DNS** (optional but recommended) to handle changing IP addresses
+- **Domain name** or Dynamic DNS hostname
+- Sufficient storage space (1-2GB minimum)
+
+### Installation on Synology NAS
+
+#### Step 1: Prepare the NAS Environment
+
+SSH into your Synology NAS:
+```bash
+ssh admin@YOUR_NAS_IP
+```
+
+Create a working directory:
+```bash
+mkdir -p /volume1/docker/openvpn
+cd /volume1/docker/openvpn
+```
+
+#### Step 2: Create docker-compose.yml on NAS
+
+Create the `docker-compose.yml` file:
+```bash
+cat > docker-compose.yml << 'EOF'
+version: '3.8'
+
+services:
+  openvpn-server:
+    image: kylemanna/openvpn:latest
+    container_name: openvpn-server
+    ports:
+      - "1194:1194/udp"
+    volumes:
+      - openvpn-data:/etc/openvpn
+      - /etc/localtime:/etc/localtime:ro
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "netstat", "-tlnup"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  openvpn-data:
+    driver: local
+EOF
+```
+
+#### Step 3: Initialize OpenVPN on NAS
+
+Generate the server configuration with your NAS's public IP or domain:
+
+```bash
+# For external IP (not recommended for changing IPs)
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_genconfig -u udp://YOUR.PUBLIC.IP.ADDRESS
+
+# For Dynamic DNS (recommended)
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_genconfig -u udp://your-nas.ddns.com
+```
+
+Initialize the PKI and certificate authority:
+```bash
+docker run -v openvpn-data:/etc/openvpn --rm -it kylemanna/openvpn \
+  ovpn_initpki
+```
+
+Generate certificates for each client:
+```bash
+docker run -v openvpn-data:/etc/openvpn --rm -it kylemanna/openvpn \
+  easyrsa build-client-full laptop nopass
+
+docker run -v openvpn-data:/etc/openvpn --rm -it kylemanna/openvpn \
+  easyrsa build-client-full smartphone nopass
+```
+
+#### Step 4: Start the VPN Server
+
+```bash
+docker-compose up -d
+```
+
+Verify the server is running:
+```bash
+docker-compose ps
+docker-compose logs -f openvpn-server
+```
+
+### Network Configuration for NAS VPN Server
+
+#### Router Port Forwarding
+
+To allow external clients to connect to your VPN server:
+
+1. **Access your router's admin interface** (usually 192.168.1.1 or 192.168.0.1)
+2. **Enable port forwarding**:
+   - External Port: `1194`
+   - Protocol: `UDP`
+   - Internal IP: `YOUR_NAS_LOCAL_IP` (e.g., 192.168.1.50)
+   - Internal Port: `1194`
+
+3. **Test port forwarding** (from external network):
+```bash
+nmap -sU -p 1194 YOUR.PUBLIC.IP.ADDRESS
+# Should show: 1194/udp open|filtered openvpn
+```
+
+#### Dynamic DNS Setup (Recommended)
+
+If your ISP changes your IP address regularly:
+
+1. **Choose a Dynamic DNS provider**: No-IP, DynDNS, FreeDNS, etc.
+2. **Install DDNS client on NAS**:
+   - Go to NAS Control Panel → Network → General
+   - Set up Dynamic DNS with your provider
+   - Test connectivity: `nslookup your-nas.ddns.com`
+
+3. **Use DDNS hostname in OpenVPN config**:
+```bash
+# Regenerate config with DDNS hostname
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_genconfig -u udp://your-nas.ddns.com
+```
+
+#### Network Access Configuration
+
+Allow clients to access resources on your home network:
+
+```bash
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_genconfig -u udp://your-nas.ddns.com \
+  -r 192.168.1.0/24 \
+  -N \
+  -c
+```
+
+This enables:
+- `-r 192.168.1.0/24`: Route to home network
+- `-N`: NAT mode (needed for NAS to access other network resources)
+- `-c`: Client-to-client communication
+
+### Firewall Configuration for NAS
+
+#### On Synology NAS
+
+If the NAS firewall is enabled (Control Panel → Security → Firewall):
+
+1. Go to **Control Panel → Security → Firewall**
+2. Click **Firewall Rules** or **Port Rules**
+3. **Add a rule** to allow incoming UDP on port 1194:
+   - Protocol: UDP
+   - Port: 1194
+   - Allow: Yes
+
+Or via SSH:
+```bash
+sudo ufw allow 1194/udp
+```
+
+#### On Your Router
+
+1. Disable UPnP if not needed for additional security
+2. Set up a static route (optional) for better performance:
+   - Destination: `192.168.255.0/24` (OpenVPN subnet)
+   - Gateway: `192.168.1.50` (NAS IP)
+
+### Client Connection to NAS VPN Server
+
+#### Step 1: Get Client Configuration
+
+Extract the `.ovpn` file for each client:
+
+```bash
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_getclient laptop > laptop.ovpn
+
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_getclient smartphone > smartphone.ovpn
+```
+
+Download these files from the NAS via SSH/SFTP or File Station
+
+#### Step 2: Install OpenVPN Client
+
+**Windows:**
+- Download OpenVPN GUI: https://openvpn.net/community-downloads/
+- Install and import the `.ovpn` file
+- Right-click → Connect
+
+**macOS:**
+- Install via Homebrew: `brew install openvpn`
+- Or use Tunnelblick: https://tunnelblick.net/
+- Import the `.ovpn` file
+
+**Linux:**
+```bash
+sudo apt install openvpn
+sudo openvpn --config laptop.ovpn
+```
+
+**iOS:**
+- Install "OpenVPN Connect" from App Store
+- Open the `.ovpn` file and import
+- Enable and connect
+
+**Android:**
+- Install "OpenVPN Connect" from Google Play
+- Open the `.ovpn` file and import
+- Enable and connect
+
+#### Step 3: Connect to VPN
+
+1. Open OpenVPN client
+2. Select the configuration file
+3. Click Connect/Enable
+4. Wait for connection confirmation
+
+**Verify connection:**
+```bash
+# On client machine, check IP
+curl https://api.ipify.org  # Should show your NAS's public IP
+
+# Or via SSH to NAS
+docker-compose logs openvpn-server | grep -i "client.*connected"
+```
+
+### Advanced NAS VPN Server Configuration
+
+#### Enable Two-Factor Authentication
+
+For enhanced security on NAS:
+
+```bash
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_genconfig -u udp://your-nas.ddns.com -2 -C AES-256-CBC
+
+docker run -v openvpn-data:/etc/openvpn --rm -it kylemanna/openvpn \
+  ovpn_initpki
+
+docker run -v openvpn-data:/etc/openvpn --rm -it kylemanna/openvpn \
+  ovpn_otp_user laptop
+```
+
+#### Static Client IPs
+
+Assign fixed VPN IPs to clients:
+
+```bash
+# SSH to NAS
+ssh admin@YOUR_NAS_IP
+cd /volume1/docker/openvpn
+
+# Create client-specific config
+mkdir -p ./ccd
+cat > ./ccd/laptop << EOF
+ifconfig-push 192.168.255.10 192.168.255.11
+EOF
+
+cat > ./ccd/smartphone << EOF
+ifconfig-push 192.168.255.20 192.168.255.21
+EOF
+
+# Restart container to apply
+docker-compose restart openvpn-server
+```
+
+#### Bandwidth Limiting
+
+Prevent VPN from consuming all NAS bandwidth:
+
+```bash
+docker update --memory=512m openvpn-server
+```
+
+Or use Linux traffic control in `docker-compose.yml`:
+```yaml
+  openvpn-server:
+    ...
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+```
+
+#### Split Tunnel (Optional)
+
+Allow clients to route only specific traffic through VPN:
+
+```bash
+docker run -v openvpn-data:/etc/openvpn --rm kylemanna/openvpn \
+  ovpn_genconfig -u udp://your-nas.ddns.com -d -r 192.168.1.0/24
+```
+
+This disables default route but routes home network traffic through VPN.
+
+### NAS-Specific Considerations
+
+#### Docker Storage Location
+
+On Synology, Docker data is stored in:
+```bash
+/var/lib/docker/volumes/openvpn-data
+```
+
+To change storage location:
+```bash
+# Move to larger volume if needed
+mv /var/lib/docker/volumes/openvpn-data /volume1/docker/openvpn-data
+docker volume create --opt type=none --opt o=bind --opt device=/volume1/docker/openvpn-data openvpn-data
+```
+
+#### NAS Performance
+
+Monitor NAS resources while VPN is running:
+```bash
+ssh admin@YOUR_NAS_IP
+# Check CPU usage
+top
+
+# Check memory usage
+free -h
+
+# Check disk I/O
+iostat -x 1 5
+```
+
+Typical VPN server usage on NAS:
+- CPU: 5-15% per active connection
+- RAM: 50-100MB base + 10-20MB per connection
+- Disk I/O: Minimal (logs only)
+
+#### Scheduled Backups
+
+Backup your VPN configuration daily:
+
+```bash
+# SSH to NAS
+ssh admin@YOUR_NAS_IP
+
+# Create backup script
+cat > /volume1/docker/backup-openvpn.sh << 'SCRIPT'
+#!/bin/bash
+BACKUP_DIR="/volume1/docker/backups"
+mkdir -p "$BACKUP_DIR"
+
+tar -czf "$BACKUP_DIR/openvpn-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  -C /var/lib/docker/volumes/openvpn-data/_data .
+
+# Keep only last 7 backups
+find "$BACKUP_DIR" -name "openvpn-*.tar.gz" -mtime +7 -delete
+SCRIPT
+
+chmod +x /volume1/docker/backup-openvpn.sh
+
+# Add to crontab (runs daily at 2 AM)
+(crontab -l; echo "0 2 * * * /volume1/docker/backup-openvpn.sh") | crontab -
+```
+
 ## Project Structure
 
 ```
